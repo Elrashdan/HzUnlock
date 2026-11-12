@@ -17,6 +17,13 @@ public final class Unlocker {
     private Unlocker() {}
 
     private static final String KEY_SF_INDEX = "sf_index";
+    private static final String KEY_USER_PREFERRED = "user_preferred";
+
+    private static String userPreferredCmd(Display.Mode m) {
+        return "cmd display set-user-preferred-display-mode "
+                + m.getPhysicalWidth() + " " + m.getPhysicalHeight() + " "
+                + Math.round(m.getRefreshRate()) + ".0";
+    }
     private static final String GREP = "grep -i -E 'refresh|rate|fps|hz|frame'";
 
     public static float target(Context c) {
@@ -42,13 +49,23 @@ public final class Unlocker {
             log.append("✓ الإعدادات كفاية، الشاشة على ").append(hz).append(" هرتز\n");
             return log.toString();
         }
-        log.append("الإعدادات لوحدها ما كفتش، بجرّب SurfaceFlinger...\n");
+        log.append("الإعدادات لوحدها ما كفتش، بجرّب وضع الشاشة المفضّل...\n");
+        Display.Mode best = HzUtil.bestMode(HzUtil.defaultDisplay(c));
+        sh(log, userPreferredCmd(best));
+        sleep(900);
+        if (atTarget(c)) {
+            HzUtil.prefs(c).edit().putBoolean(KEY_USER_PREFERRED, true).apply();
+            log.append("✓ اشتغل! الشاشة على ").append(hz).append(" هرتز\n");
+            return log.toString();
+        }
+        log.append("ما كفاش، بجرّب SurfaceFlinger...\n");
 
         if (forceSurfaceFlinger(c, log)) {
             log.append("✓ اشتغل! الشاشة على ").append(hz).append(" هرتز\n");
         } else {
             log.append("✗ ولا طريقة غيّرت المعامل اللي السيستم بيبلّغ عنه.\n");
             log.append("بص على مؤشر Show refresh rate نفسه، يمكن اتغيّر فعلًا.\n");
+            log.append("\n===== تقرير تفصيلي =====\n").append(diagnostics()).append('\n');
         }
         return log.toString();
     }
@@ -71,7 +88,7 @@ public final class Unlocker {
             boolean ok = atTarget(c);
             log.append("  رقم ").append(idx).append(": ")
                     .append(ok ? "✓" : "✗")
-                    .append(out.startsWith("ERR") ? " (" + out + ")" : "")
+                    .append(out.isEmpty() ? "" : "  [" + out.replace('\n', ' ') + "]")
                     .append('\n');
             if (ok) {
                 HzUtil.prefs(c).edit().putInt(KEY_SF_INDEX, idx).apply();
@@ -85,7 +102,9 @@ public final class Unlocker {
     public static void reapply(Context c) {
         if (!ShizukuShell.isReady() || atTarget(c)) return;
         int idx = HzUtil.prefs(c).getInt(KEY_SF_INDEX, -1);
-        if (idx >= 0) {
+        if (HzUtil.prefs(c).getBoolean(KEY_USER_PREFERRED, false)) {
+            ShizukuShell.exec(userPreferredCmd(HzUtil.bestMode(HzUtil.defaultDisplay(c))));
+        } else if (idx >= 0) {
             ShizukuShell.exec("service call SurfaceFlinger 1035 i32 " + idx);
         } else if (HzUtil.prefs(c).getBoolean(HzUtil.KEY_SETTINGS_APPLIED, false)) {
             int hz = Math.round(target(c));
@@ -96,6 +115,7 @@ public final class Unlocker {
 
     public static boolean hasWorkingFix(Context c) {
         return HzUtil.prefs(c).getInt(KEY_SF_INDEX, -1) >= 0
+                || HzUtil.prefs(c).getBoolean(KEY_USER_PREFERRED, false)
                 || HzUtil.prefs(c).getBoolean(HzUtil.KEY_SETTINGS_APPLIED, false);
     }
 
@@ -103,7 +123,9 @@ public final class Unlocker {
         StringBuilder log = new StringBuilder();
         sh(log, "settings put system min_refresh_rate 0.0");
         sh(log, "service call SurfaceFlinger 1035 i32 -1");
+        sh(log, "cmd display reset-user-preferred-display-mode");
         HzUtil.prefs(c).edit()
+                .remove(KEY_USER_PREFERRED)
                 .putBoolean(HzUtil.KEY_SETTINGS_APPLIED, false)
                 .remove(KEY_SF_INDEX).apply();
         log.append("اترجع للطبيعي. لو لسه ثابت، اعمل ريستارت.\n");
@@ -111,7 +133,15 @@ public final class Unlocker {
     }
 
     public static String diagnostics() {
-        return "[system]\n" + ShizukuShell.exec("settings list system | " + GREP)
+        return "[votes]\n" + ShizukuShell.exec(
+                    "dumpsys display | grep -i -E 'vote|priority|refreshrate|renderframerate|"
+                    + "appRequest|lowpower|skin|thermal|brightness.*rate|modeId' | head -70")
+                + "\n\n[surfaceflinger]\n" + ShizukuShell.exec(
+                    "dumpsys SurfaceFlinger | grep -i -E 'refresh|fps|activeMode|desiredMode|"
+                    + "policy|backdoor' | head -40")
+                + "\n\n[props]\n" + ShizukuShell.exec(
+                    "getprop | grep -i -E 'refresh|fps|frame_rate|framerate|ltpo|hz' | head -40")
+                + "\n\n[system]\n" + ShizukuShell.exec("settings list system | " + GREP)
                 + "\n\n[secure]\n" + ShizukuShell.exec("settings list secure | " + GREP)
                 + "\n\n[global]\n" + ShizukuShell.exec("settings list global | " + GREP);
     }
