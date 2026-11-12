@@ -93,7 +93,7 @@ public class MainActivity extends Activity {
         LinearLayout row = new LinearLayout(this);
         row.setOrientation(LinearLayout.HORIZONTAL);
         row.addView(small("انسخ التقرير", v -> copyLog()), weight());
-        row.addView(small("تقرير تفصيلي", v -> runDiagnostics()), weight());
+        row.addView(small("فحص خدمات Honor", v -> runDiagnostics()), weight());
         row.addView(small("وقّف ورجّع الطبيعي", v -> runReset()), weight());
         root.addView(row);
 
@@ -224,7 +224,8 @@ public class MainActivity extends Activity {
         if (!ShizukuShell.isReady()) { toast("شغّل Shizuku الأول"); return; }
         logView.setText("بجمع المعلومات...");
         worker.execute(() -> {
-            String out = Unlocker.diagnostics();
+            String out = "===== فحص خدمات Honor =====\n" + Unlocker.probe()
+                    + "\n\n===== الحالة =====\n" + Unlocker.diagnostics();
             main.post(() -> logView.setText(out));
         });
     }

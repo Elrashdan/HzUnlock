@@ -84,6 +84,23 @@ public final class Unlocker {
                     + "; settings list global | " + GREP);
     }
 
+    /** Looks for Honor's own frame-rate / performance services and what they expose to the shell. */
+    public static String probe() {
+        String pat = "aps|fps|frame|refresh|perf|hnperf|powerkit|iaware|hwaps|game|lcd|display";
+        String script =
+                "echo '[services]'; service list | grep -i -E '" + pat + "' | cut -c1-160 | head -50; "
+                + "echo; echo '[dumpsys -l]'; dumpsys -l | grep -i -E '" + pat + "' | head -50; "
+                + "echo; echo '[packages]'; pm list packages | grep -i -E 'aps|perf|game|frame|fps|powerkit|iaware|hn' | head -50; "
+                + "echo; echo '[props]'; getprop | grep -i -E 'aps|fps|perf\\.|frame|hn\\.display|lcd' | head -60; "
+                + "echo; echo '[per-service]'; "
+                + "for s in $(dumpsys -l | tr -d ' ' | grep -i -E 'aps|fps|frame|refresh|perf|powerkit|iaware|game'); do "
+                + "  echo \"=== $s ===\"; "
+                + "  timeout 5 cmd $s help 2>&1 | head -25; "
+                + "  echo '--- dumpsys'; timeout 5 dumpsys $s 2>&1 | grep -v '^$' | cut -c1-200 | head -25; "
+                + "done";
+        return ShizukuShell.exec(script);
+    }
+
     private static void sh(StringBuilder log, String cmd) {
         String out = ShizukuShell.exec(cmd);
         log.append("$ ").append(cmd).append('\n');
