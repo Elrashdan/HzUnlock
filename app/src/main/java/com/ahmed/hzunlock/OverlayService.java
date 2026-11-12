@@ -5,42 +5,61 @@ import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.app.Service;
-import android.content.Context;
 import android.content.Intent;
 import android.content.pm.ServiceInfo;
-import android.graphics.PixelFormat;
+import android.hardware.display.DisplayManager;
 import android.os.Build;
+import android.os.Handler;
 import android.os.IBinder;
-import android.provider.Settings;
-import android.view.Display;
-import android.view.Gravity;
-import android.view.View;
-import android.view.WindowManager;
+import android.os.Looper;
+
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+
+import rikka.shizuku.Shizuku;
 
 /**
- * Keeps an invisible 1x1 overlay window on screen that asks the system for the
- * fastest display mode. Because the overlay sits above every app, its request
- * applies to whatever is on screen.
+ * Background guard: whenever MagicOS drops the refresh rate, it puts it back
+ * through Shizuku. Also waits for Shizuku after a restart and re-applies then.
  */
 public class OverlayService extends Service {
-    private static final String CHANNEL = "hz_overlay";
+    private static final String CHANNEL = "hz_guard";
     private static volatile boolean running = false;
 
-    private WindowManager wm;
-    private View overlay;
+    private final ExecutorService worker = Executors.newSingleThreadExecutor();
+    private final Handler main = new Handler(Looper.getMainLooper());
+    private DisplayManager dm;
+    private long lastApply = 0;
 
     public static boolean isRunning() { return running; }
+
+    private final DisplayManager.DisplayListener displayListener =
+            new DisplayManager.DisplayListener() {
+                @Override public void onDisplayAdded(int id) {}
+                @Override public void onDisplayRemoved(int id) {}
+                @Override public void onDisplayChanged(int id) { scheduleReapply(); }
+            };
+
+    private final Shizuku.OnBinderReceivedListener binderListener = this::scheduleReapply;
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
         startAsForeground();
-        if (!Settings.canDrawOverlays(this)) {
-            stopSelf();
-            return START_NOT_STICKY;
+        if (!running) {
+            running = true;
+            dm = getSystemService(DisplayManager.class);
+            dm.registerDisplayListener(displayListener, main);
+            Shizuku.addBinderReceivedListenerSticky(binderListener);
         }
-        addOverlay();
-        running = true;
+        scheduleReapply();
         return START_STICKY;
+    }
+
+    private void scheduleReapply() {
+        long now = System.currentTimeMillis();
+        if (now - lastApply < 1500) return;
+        lastApply = now;
+        worker.execute(() -> Unlocker.reapply(this));
     }
 
     private void startAsForeground() {
@@ -51,11 +70,10 @@ public class OverlayService extends Service {
         }
         PendingIntent open = PendingIntent.getActivity(this, 0,
                 new Intent(this, MainActivity.class), PendingIntent.FLAG_IMMUTABLE);
-        Display.Mode m = HzUtil.bestMode(HzUtil.defaultDisplay(this));
         Notification n = new Notification.Builder(this, CHANNEL)
                 .setSmallIcon(android.R.drawable.ic_menu_view)
                 .setContentTitle("Hz Unlock شغّال")
-                .setContentText("طالب " + Math.round(m.getRefreshRate()) + " هرتز")
+                .setContentText("محافظ على " + Math.round(Unlocker.target(this)) + " هرتز")
                 .setContentIntent(open)
                 .setOngoing(true)
                 .build();
@@ -66,38 +84,12 @@ public class OverlayService extends Service {
         }
     }
 
-    private void addOverlay() {
-        if (overlay != null) return;
-        wm = (WindowManager) getSystemService(Context.WINDOW_SERVICE);
-        Display.Mode m = HzUtil.bestMode(HzUtil.defaultDisplay(this));
-
-        WindowManager.LayoutParams lp = new WindowManager.LayoutParams(
-                1, 1,
-                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
-                        | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
-                        | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
-                PixelFormat.TRANSLUCENT);
-        lp.gravity = Gravity.TOP | Gravity.START;
-        lp.preferredDisplayModeId = m.getModeId();
-        lp.preferredRefreshRate = m.getRefreshRate();
-
-        overlay = new View(this);
-        try {
-            wm.addView(overlay, lp);
-        } catch (Exception e) {
-            overlay = null;
-            stopSelf();
-        }
-    }
-
     @Override
     public void onDestroy() {
         running = false;
-        if (overlay != null && wm != null) {
-            try { wm.removeView(overlay); } catch (Exception ignored) {}
-            overlay = null;
-        }
+        if (dm != null) dm.unregisterDisplayListener(displayListener);
+        Shizuku.removeBinderReceivedListener(binderListener);
+        worker.shutdownNow();
         super.onDestroy();
     }
 

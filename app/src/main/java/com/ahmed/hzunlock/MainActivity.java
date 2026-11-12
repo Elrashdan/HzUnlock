@@ -7,6 +7,8 @@ import android.content.Intent;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.provider.Settings;
 import android.util.TypedValue;
 import android.view.Display;
@@ -18,13 +20,27 @@ import android.widget.Switch;
 import android.widget.TextView;
 import android.widget.Toast;
 
-public class MainActivity extends Activity {
-    private static final String GRANT_CMD =
-            "pm grant com.ahmed.hzunlock android.permission.WRITE_SECURE_SETTINGS";
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
-    private TextView info;
-    private Button overlayBtn;
-    private Switch autostart;
+import rikka.shizuku.Shizuku;
+
+public class MainActivity extends Activity {
+    private final ExecutorService worker = Executors.newSingleThreadExecutor();
+    private final Handler main = new Handler(Looper.getMainLooper());
+
+    private TextView status, info, logView;
+    private Button mainBtn;
+    private boolean busy = false;
+
+    private final Shizuku.OnBinderReceivedListener onBinder = () -> main.post(this::refresh);
+    private final Shizuku.OnBinderDeadListener onDead = () -> main.post(this::refresh);
+    private final Shizuku.OnRequestPermissionResultListener onPerm = (code, result) -> {
+        main.post(() -> {
+            refresh();
+            if (ShizukuShell.isReady()) runUnlock();
+        });
+    };
 
     @Override
     protected void onCreate(Bundle b) {
@@ -44,43 +60,50 @@ public class MainActivity extends Activity {
         title.setTextSize(26);
         root.addView(title);
 
-        info = new TextView(this);
-        info.setTextSize(15);
-        info.setPadding(0, dp(12), 0, dp(12));
-        root.addView(info);
+        status = new TextView(this);
+        status.setTextSize(17);
+        status.setPadding(0, dp(14), 0, dp(10));
+        root.addView(status);
 
-        // Method 1: overlay (no ADB needed)
-        root.addView(section("الطريقة ١: طبقة شفافة (من غير ADB)"));
-        overlayBtn = button("", v -> toggleOverlay());
-        root.addView(overlayBtn);
+        mainBtn = new Button(this);
+        mainBtn.setAllCaps(false);
+        mainBtn.setTextSize(18);
+        mainBtn.setOnClickListener(v -> onMainClick());
+        root.addView(mainBtn);
 
-        autostart = new Switch(this);
+        Switch autostart = new Switch(this);
         autostart.setText("شغّله تلقائي بعد الريستارت");
-        autostart.setPadding(0, dp(8), 0, dp(8));
-        autostart.setChecked(HzUtil.prefs(this).getBoolean(HzUtil.KEY_AUTOSTART, false));
+        autostart.setPadding(0, dp(12), 0, dp(12));
+        autostart.setChecked(HzUtil.prefs(this).getBoolean(HzUtil.KEY_AUTOSTART, true));
         autostart.setOnCheckedChangeListener((s, on) ->
                 HzUtil.prefs(this).edit().putBoolean(HzUtil.KEY_AUTOSTART, on).apply());
         root.addView(autostart);
 
-        // Method 2: system settings (needs one-time grant)
-        root.addView(section("الطريقة ٢: إعدادات السيستم (محتاجة إذن مرة واحدة)"));
-        root.addView(button("ثبّت أعلى معامل في الإعدادات", v -> applySettings()));
-        root.addView(button("رجّع الإعدادات للطبيعي", v -> {
-            String err = HzUtil.resetSettings(this);
-            toast(err == null ? "اترجعت" : messageFor(err));
-            refresh();
-        }));
-        root.addView(button("انسخ أمر الإذن (لـ aShell)", v -> {
-            ClipboardManager cm = getSystemService(ClipboardManager.class);
-            cm.setPrimaryClip(ClipData.newPlainText("cmd", GRANT_CMD));
-            toast("اتنسخ، الصقه في aShell");
-        }));
+        info = new TextView(this);
+        info.setTextSize(14);
+        info.setPadding(0, dp(8), 0, dp(8));
+        root.addView(info);
 
-        root.addView(button("تحديث المعلومات", v -> refresh()));
+        logView = new TextView(this);
+        logView.setTextSize(13);
+        logView.setTextIsSelectable(true);
+        logView.setPadding(0, dp(8), 0, dp(8));
+        root.addView(logView);
+
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.addView(small("انسخ التقرير", v -> copyLog()), weight());
+        row.addView(small("تقرير تفصيلي", v -> runDiagnostics()), weight());
+        row.addView(small("وقّف ورجّع الطبيعي", v -> runReset()), weight());
+        root.addView(row);
 
         ScrollView sv = new ScrollView(this);
         sv.addView(root);
         setContentView(sv);
+
+        Shizuku.addBinderReceivedListenerSticky(onBinder);
+        Shizuku.addBinderDeadListener(onDead);
+        Shizuku.addRequestPermissionResultListener(onPerm);
     }
 
     @Override
@@ -89,83 +112,152 @@ public class MainActivity extends Activity {
         refresh();
     }
 
+    @Override
+    protected void onDestroy() {
+        Shizuku.removeBinderReceivedListener(onBinder);
+        Shizuku.removeBinderDeadListener(onDead);
+        Shizuku.removeRequestPermissionResultListener(onPerm);
+        worker.shutdownNow();
+        super.onDestroy();
+    }
+
     private void refresh() {
         Display d = getDisplay();
-        Display.Mode cur = d.getMode();
         Display.Mode best = HzUtil.bestMode(d);
+        int now = Math.round(d.getRefreshRate());
+        int target = Math.round(best.getRefreshRate());
+
+        switch (ShizukuShell.state()) {
+            case NOT_RUNNING:
+                status.setText(isShizukuInstalled()
+                        ? "الخطوة ١ من ٢: Shizuku مش شغّال.\nافتحه واضغط Start (عن طريق Wireless debugging)، وبعدين ارجع هنا."
+                        : "الخطوة ١ من ٢: محتاج تثبّت تطبيق Shizuku الأول.");
+                mainBtn.setText(isShizukuInstalled() ? "افتح Shizuku" : "نزّل Shizuku");
+                break;
+            case NO_PERMISSION:
+                status.setText("الخطوة ٢ من ٢: اسمح لـ Hz Unlock يستخدم Shizuku.");
+                mainBtn.setText("اسمح وفك القفل");
+                break;
+            case READY:
+                boolean on = OverlayService.isRunning() && now >= target - 1;
+                status.setText(on ? "✓ شغّال على " + target + " هرتز" : "جاهز. اضغط الزرار.");
+                mainBtn.setText(busy ? "جاري التنفيذ..." : "فك قفل " + target + " هرتز");
+                break;
+        }
+        mainBtn.setEnabled(!busy);
 
         StringBuilder s = new StringBuilder();
-        s.append("المعامل دلوقتي: ").append(round(d.getRefreshRate())).append(" هرتز\n");
-        s.append("أعلى وضع الشاشة بتعلنه: ").append(round(best.getRefreshRate())).append(" هرتز\n\n");
-        s.append("كل الأوضاع المتاحة:\n");
+        s.append("المعامل دلوقتي: ").append(now).append(" هرتز")
+                .append("   |   أعلى وضع: ").append(target).append(" هرتز\n");
         for (Display.Mode m : d.getSupportedModes()) {
             s.append("• وضع ").append(m.getModeId()).append(": ")
-                    .append(m.getPhysicalWidth()).append("×").append(m.getPhysicalHeight())
-                    .append(" @ ").append(round(m.getRefreshRate())).append(" هرتز")
-                    .append(m.getModeId() == cur.getModeId() ? "  ← الحالي" : "")
-                    .append("\n");
+                    .append(Math.round(m.getRefreshRate())).append(" هرتز")
+                    .append(m.getModeId() == d.getMode().getModeId() ? "  ← الحالي" : "")
+                    .append('\n');
         }
-        s.append("\npeak_refresh_rate = ").append(HzUtil.readSetting(this, "peak_refresh_rate"));
-        s.append("\nmin_refresh_rate = ").append(HzUtil.readSetting(this, "min_refresh_rate"));
-        s.append("\n\nإذن الطبقة: ").append(Settings.canDrawOverlays(this) ? "✓" : "✗");
-        s.append("\nإذن الإعدادات: ").append(HzUtil.hasSecureSettings(this) ? "✓" : "✗");
-        if (best.getRefreshRate() < 100) {
-            s.append("\n\n⚠ السيستم مش معلن وضع 120 هرتز، فغالبًا مفيش أي طريقة من غير روت هتفتحه.");
-        }
+        s.append("peak = ").append(HzUtil.readSetting(this, "peak_refresh_rate"))
+                .append("   min = ").append(HzUtil.readSetting(this, "min_refresh_rate"));
         info.setText(s.toString());
-
-        overlayBtn.setText(OverlayService.isRunning() ? "وقّف الطبقة" : "شغّل الطبقة (120 هرتز)");
     }
 
-    private void toggleOverlay() {
-        if (OverlayService.isRunning()) {
-            stopService(new Intent(this, OverlayService.class));
-            overlayBtn.postDelayed(this::refresh, 300);
-            return;
+    private void onMainClick() {
+        switch (ShizukuShell.state()) {
+            case NOT_RUNNING:
+                openShizuku();
+                break;
+            case NO_PERMISSION:
+                Shizuku.requestPermission(ShizukuShell.REQUEST_CODE);
+                break;
+            case READY:
+                runUnlock();
+                break;
         }
-        if (!Settings.canDrawOverlays(this)) {
-            toast("اسمح للتطبيق يظهر فوق التطبيقات التانية، وبعدين ارجع");
-            startActivity(new Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-                    Uri.parse("package:" + getPackageName())));
-            return;
-        }
-        startForegroundService(new Intent(this, OverlayService.class));
-        overlayBtn.postDelayed(this::refresh, 800);
     }
 
-    private void applySettings() {
-        float hz = HzUtil.bestMode(getDisplay()).getRefreshRate();
-        String err = HzUtil.applySettings(this, hz);
-        toast(err == null ? "اتثبّت على " + round(hz) + " هرتز" : messageFor(err));
+    private void runUnlock() {
+        if (busy) return;
+        busy = true;
+        logView.setText("جاري التنفيذ...");
         refresh();
+        worker.execute(() -> {
+            String log = Unlocker.unlock(this);
+            main.post(() -> {
+                busy = false;
+                logView.setText(log);
+                if (Unlocker.hasWorkingFix(this)) {
+                    startForegroundService(new Intent(this, OverlayService.class));
+                }
+                main.postDelayed(this::refresh, 600);
+            });
+        });
     }
 
-    private String messageFor(String err) {
-        if ("no_permission".equals(err)) {
-            return "محتاج الإذن الأول: انسخ الأمر ونفّذه في aShell";
+    private void runReset() {
+        stopService(new Intent(this, OverlayService.class));
+        if (!ShizukuShell.isReady()) {
+            toast("وقّفت الخدمة. باقي الإعدادات هترجع بعد ريستارت.");
+            return;
         }
-        return "حصل خطأ: " + err;
+        worker.execute(() -> {
+            String log = Unlocker.reset(this);
+            main.post(() -> { logView.setText(log); refresh(); });
+        });
     }
 
-    private TextView section(String t) {
-        TextView v = new TextView(this);
-        v.setText(t);
-        v.setTextSize(17);
-        v.setPadding(0, dp(18), 0, dp(6));
-        return v;
+    private void runDiagnostics() {
+        if (!ShizukuShell.isReady()) { toast("شغّل Shizuku الأول"); return; }
+        logView.setText("بجمع المعلومات...");
+        worker.execute(() -> {
+            String out = Unlocker.diagnostics();
+            main.post(() -> logView.setText(out));
+        });
     }
 
-    private Button button(String t, View.OnClickListener l) {
+    private void copyLog() {
+        String text = info.getText() + "\n\n" + logView.getText();
+        getSystemService(ClipboardManager.class)
+                .setPrimaryClip(ClipData.newPlainText("Hz Unlock", text));
+        toast("اتنسخ");
+    }
+
+    private boolean isShizukuInstalled() {
+        try {
+            getPackageManager().getPackageInfo(ShizukuShell.SHIZUKU_PKG, 0);
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private void openShizuku() {
+        Intent launch = getPackageManager().getLaunchIntentForPackage(ShizukuShell.SHIZUKU_PKG);
+        if (launch != null) {
+            startActivity(launch);
+            return;
+        }
+        try {
+            startActivity(new Intent(Intent.ACTION_VIEW,
+                    Uri.parse("market://details?id=" + ShizukuShell.SHIZUKU_PKG)));
+        } catch (Exception e) {
+            startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(
+                    "https://play.google.com/store/apps/details?id=" + ShizukuShell.SHIZUKU_PKG)));
+        }
+    }
+
+    private Button small(String t, View.OnClickListener l) {
         Button b = new Button(this);
         b.setText(t);
         b.setAllCaps(false);
+        b.setTextSize(13);
         b.setOnClickListener(l);
         return b;
     }
 
-    private void toast(String t) { Toast.makeText(this, t, Toast.LENGTH_LONG).show(); }
+    private LinearLayout.LayoutParams weight() {
+        return new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
+    }
 
-    private static String round(float f) { return String.valueOf(Math.round(f)); }
+    private void toast(String t) { Toast.makeText(this, t, Toast.LENGTH_LONG).show(); }
 
     private int dp(int v) {
         return (int) TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, v,
