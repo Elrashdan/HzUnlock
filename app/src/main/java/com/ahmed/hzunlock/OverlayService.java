@@ -7,11 +7,15 @@ import android.app.PendingIntent;
 import android.app.Service;
 import android.content.Intent;
 import android.content.pm.ServiceInfo;
-import android.hardware.display.DisplayManager;
+import android.graphics.PixelFormat;
 import android.os.Build;
-import android.os.Handler;
 import android.os.IBinder;
-import android.os.Looper;
+import android.provider.Settings;
+import android.view.Display;
+import android.view.Gravity;
+import android.view.WindowManager;
+
+import org.lsposed.hiddenapibypass.HiddenApiBypass;
 
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -19,47 +23,74 @@ import java.util.concurrent.Executors;
 import rikka.shizuku.Shizuku;
 
 /**
- * Background guard: whenever MagicOS drops the refresh rate, it puts it back
- * through Shizuku. Also waits for Shizuku after a restart and re-applies then.
+ * Keeps the RateKeeper layer on screen above every app, and re-applies the
+ * refresh-rate settings once Shizuku is back after a restart.
  */
 public class OverlayService extends Service {
     private static final String CHANNEL = "hz_guard";
     private static volatile boolean running = false;
 
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
-    private final Handler main = new Handler(Looper.getMainLooper());
-    private DisplayManager dm;
-    private long lastApply = 0;
+    private WindowManager wm;
+    private RateKeeper keeper;
 
     public static boolean isRunning() { return running; }
 
-    private final DisplayManager.DisplayListener displayListener =
-            new DisplayManager.DisplayListener() {
-                @Override public void onDisplayAdded(int id) {}
-                @Override public void onDisplayRemoved(int id) {}
-                @Override public void onDisplayChanged(int id) { scheduleReapply(); }
-            };
-
-    private final Shizuku.OnBinderReceivedListener binderListener = this::scheduleReapply;
+    private final Shizuku.OnBinderReceivedListener binderListener =
+            () -> worker.execute(() -> Unlocker.reapply(this));
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
         startAsForeground();
         if (!running) {
             running = true;
-            dm = getSystemService(DisplayManager.class);
-            dm.registerDisplayListener(displayListener, main);
             Shizuku.addBinderReceivedListenerSticky(binderListener);
         }
-        scheduleReapply();
+        addKeeper();
         return START_STICKY;
     }
 
-    private void scheduleReapply() {
-        long now = System.currentTimeMillis();
-        if (now - lastApply < 1500) return;
-        lastApply = now;
-        worker.execute(() -> Unlocker.reapply(this));
+    private void addKeeper() {
+        if (keeper != null) return;
+        if (!Settings.canDrawOverlays(this)) return;
+
+        Display.Mode best = HzUtil.bestMode(HzUtil.defaultDisplay(this));
+        float hz = best.getRefreshRate();
+        int screenH = getResources().getDisplayMetrics().heightPixels;
+
+        WindowManager.LayoutParams lp = new WindowManager.LayoutParams(
+                WindowManager.LayoutParams.MATCH_PARENT,
+                Math.max(200, screenH / 4),
+                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                        | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                        | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                PixelFormat.TRANSLUCENT);
+        lp.gravity = Gravity.TOP | Gravity.START;
+        // Must stay at or below 0.8, or Android blocks touches on apps underneath.
+        lp.alpha = 0.5f;
+        lp.preferredDisplayModeId = best.getModeId();
+        lp.preferredRefreshRate = hz;
+        setHiddenMinMax(lp, hz);
+
+        wm = getSystemService(WindowManager.class);
+        keeper = new RateKeeper(this, hz);
+        try {
+            wm.addView(keeper.view(), lp);
+        } catch (Exception e) {
+            keeper = null;
+        }
+    }
+
+    /** Window-level min/max rate request; hidden API, so reached by reflection. */
+    private static void setHiddenMinMax(WindowManager.LayoutParams lp, float hz) {
+        try {
+            if (Build.VERSION.SDK_INT >= 28) HiddenApiBypass.addHiddenApiExemptions("L");
+            WindowManager.LayoutParams.class
+                    .getField("preferredMinDisplayRefreshRate").setFloat(lp, hz);
+            WindowManager.LayoutParams.class
+                    .getField("preferredMaxDisplayRefreshRate").setFloat(lp, hz);
+        } catch (Throwable ignored) {}
     }
 
     private void startAsForeground() {
@@ -73,7 +104,7 @@ public class OverlayService extends Service {
         Notification n = new Notification.Builder(this, CHANNEL)
                 .setSmallIcon(android.R.drawable.ic_menu_view)
                 .setContentTitle("Hz Unlock شغّال")
-                .setContentText("محافظ على " + Math.round(Unlocker.target(this)) + " هرتز")
+                .setContentText("طالب " + Math.round(Unlocker.target(this)) + " هرتز")
                 .setContentIntent(open)
                 .setOngoing(true)
                 .build();
@@ -87,7 +118,11 @@ public class OverlayService extends Service {
     @Override
     public void onDestroy() {
         running = false;
-        if (dm != null) dm.unregisterDisplayListener(displayListener);
+        if (keeper != null) {
+            keeper.stop();
+            try { wm.removeView(keeper.view()); } catch (Exception ignored) {}
+            keeper = null;
+        }
         Shizuku.removeBinderReceivedListener(binderListener);
         worker.shutdownNow();
         super.onDestroy();

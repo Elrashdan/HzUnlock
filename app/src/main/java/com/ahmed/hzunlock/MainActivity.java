@@ -180,14 +180,30 @@ public class MainActivity extends Activity {
         logView.setText("جاري التنفيذ...");
         refresh();
         worker.execute(() -> {
-            String log = Unlocker.unlock(this);
+            String log = Unlocker.prepare(this);
             main.post(() -> {
-                busy = false;
                 logView.setText(log);
-                if (Unlocker.hasWorkingFix(this)) {
+                stopService(new Intent(this, OverlayService.class));
+                main.postDelayed(() -> {
+                    if (!Settings.canDrawOverlays(this)) {
+                        busy = false;
+                        logView.append("✗ إذن الظهور فوق التطبيقات لسه مقفول. فعّله وجرّب تاني.\n");
+                        startActivity(new Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                                Uri.parse("package:" + getPackageName())));
+                        refresh();
+                        return;
+                    }
                     startForegroundService(new Intent(this, OverlayService.class));
-                }
-                main.postDelayed(this::refresh, 600);
+                    // Give SurfaceFlinger a moment to switch, then check.
+                    main.postDelayed(() -> worker.execute(() -> {
+                        String result = Unlocker.verify(this);
+                        main.post(() -> {
+                            busy = false;
+                            logView.append("\n" + result);
+                            refresh();
+                        });
+                    }), 3000);
+                }, 400);
             });
         });
     }
