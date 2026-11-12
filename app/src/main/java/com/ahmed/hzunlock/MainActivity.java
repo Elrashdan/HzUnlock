@@ -1,6 +1,7 @@
 package com.ahmed.hzunlock;
 
 import android.app.Activity;
+import android.app.AlertDialog;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Intent;
@@ -97,6 +98,17 @@ public class MainActivity extends Activity {
         row.addView(small("وقّف ورجّع الطبيعي", v -> runReset()), weight());
         root.addView(row);
 
+        TextView hnTitle = new TextView(this);
+        hnTitle.setText("تجربة: تعطيل خدمة Honor اللي بتقفل المعامل");
+        hnTitle.setTextSize(16);
+        hnTitle.setPadding(0, dp(18), 0, dp(6));
+        root.addView(hnTitle);
+        LinearLayout row2 = new LinearLayout(this);
+        row2.setOrientation(LinearLayout.HORIZONTAL);
+        row2.addView(small("جرّب التعطيل (بيرجع لوحده)", v -> confirmHnapsTest()), weight());
+        row2.addView(small("رجّع خدمة Honor", v -> restoreHnaps()), weight());
+        root.addView(row2);
+
         ScrollView sv = new ScrollView(this);
         sv.addView(root);
         setContentView(sv);
@@ -114,6 +126,11 @@ public class MainActivity extends Activity {
 
     @Override
     protected void onDestroy() {
+        if (restorePending) {
+            // Leaving the app mid-test must never leave Honor's service disabled.
+            main.removeCallbacks(autoRestore);
+            new Thread(Unlocker::enableHnaps).start();
+        }
         Shizuku.removeBinderReceivedListener(onBinder);
         Shizuku.removeBinderDeadListener(onDead);
         Shizuku.removeRequestPermissionResultListener(onPerm);
@@ -206,6 +223,74 @@ public class MainActivity extends Activity {
                 }, 400);
             });
         });
+    }
+
+    private final Runnable autoRestore = this::restoreHnaps;
+    private volatile boolean restorePending = false;
+
+    private void confirmHnapsTest() {
+        if (!ShizukuShell.isReady()) { toast("شغّل Shizuku الأول"); return; }
+        new AlertDialog.Builder(this)
+                .setTitle("تجربة تعطيل hnaps")
+                .setMessage("هعطّل خدمة Honor وأقيس المعامل، وبعد 60 ثانية هترجع لوحدها.\n\n"
+                        + "مهم: ما تعملش ريستارت للتابلت وهي معطّلة.")
+                .setPositiveButton("ابدأ", (d, w) -> runHnapsTest())
+                .setNegativeButton("إلغاء", null)
+                .show();
+    }
+
+    private void runHnapsTest() {
+        logView.setText("بعطّل الخدمة...");
+        worker.execute(() -> {
+            String prep = Unlocker.prepare(this);
+            String out = Unlocker.disableHnaps();
+            main.post(() -> {
+                startForegroundService(new Intent(this, OverlayService.class));
+                restorePending = true;
+                main.postDelayed(autoRestore, 60000);
+                main.postDelayed(() -> worker.execute(() -> {
+                    String policy = Unlocker.sfPolicy();
+                    int now = Math.round(getDisplay().getRefreshRate());
+                    main.post(() -> {
+                        logView.setText("$ pm disable-user " + Unlocker.HNAPS + "\n" + out
+                                + "\n\nالمعامل حسب السيستم: " + now + " هرتز\n"
+                                + "SurfaceFlinger:\n" + policy + "\n");
+                        refresh();
+                        showKeepDialog(now);
+                    });
+                }), 4000);
+            });
+        });
+    }
+
+    private void showKeepDialog(int now) {
+        new AlertDialog.Builder(this)
+                .setTitle("المعامل دلوقتي " + now + " هرتز")
+                .setMessage("بص على مؤشر Show refresh rate.\n"
+                        + "الخدمة هترجع لوحدها خلال أقل من دقيقة، إلا لو اخترت تسيبها معطّلة.")
+                .setCancelable(false)
+                .setPositiveButton("رجّعها دلوقتي", (d, w) -> restoreHnaps())
+                .setNegativeButton("سيبها معطّلة", (d, w) -> {
+                    main.removeCallbacks(autoRestore);
+                    restorePending = false;
+                    logView.append("\nسبتها معطّلة. لو حصل أي حاجة غريبة، اضغط \"رجّع خدمة Honor\" قبل أي ريستارت.\n");
+                })
+                .show();
+    }
+
+    private void restoreHnaps() {
+        main.removeCallbacks(autoRestore);
+        restorePending = false;
+        if (!ShizukuShell.isReady()) { toast("شغّل Shizuku الأول عشان أرجّعها"); return; }
+        new Thread(() -> {
+            String out = Unlocker.enableHnaps();
+            boolean stillOff = Unlocker.hnapsDisabled();
+            main.post(() -> {
+                logView.append("\n$ pm enable " + Unlocker.HNAPS + "\n" + out + "\n"
+                        + (stillOff ? "✗ لسه معطّلة! جرّب تاني." : "✓ خدمة Honor رجعت شغّالة.") + "\n");
+                refresh();
+            });
+        }).start();
     }
 
     private void runReset() {

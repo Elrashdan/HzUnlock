@@ -101,6 +101,25 @@ public final class Unlocker {
         return ShizukuShell.exec(script);
     }
 
+    public static final String HNAPS = "com.hihonor.android.hnaps";
+
+    public static String disableHnaps() {
+        return ShizukuShell.exec("pm disable-user --user 0 " + HNAPS + "; am force-stop " + HNAPS);
+    }
+
+    public static String enableHnaps() {
+        return ShizukuShell.exec("pm enable --user 0 " + HNAPS);
+    }
+
+    public static boolean hnapsDisabled() {
+        return ShizukuShell.exec("pm list packages -d").contains(HNAPS);
+    }
+
+    /** The one line that shows what SurfaceFlinger is actually allowed to use. */
+    public static String sfPolicy() {
+        return ShizukuShell.exec("dumpsys SurfaceFlinger | grep -m1 displayManagerPolicy | cut -c1-190");
+    }
+
     private static void sh(StringBuilder log, String cmd) {
         String out = ShizukuShell.exec(cmd);
         log.append("$ ").append(cmd).append('\n');
